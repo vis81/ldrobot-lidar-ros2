@@ -237,6 +237,9 @@ private:
   // ----> Diagnostic
   double _pubFreq = 0.0; ///< Publishing frequency (Hz).
   std::atomic<bool> _publishing{false}; ///< Publishing flag.
+  std::atomic<bool> _connected{false}; ///< Serial port open and lidar answering.
+  double _timeoutSince = 0.0; ///< steady_clock seconds of the first timeout in a run, 0 = none.
+  double _lostAfter_sec = 3.0; ///< Timeouts for this long mean the device is gone.
   // <---- Diagnostic
 };
 

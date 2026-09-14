@@ -13,6 +13,8 @@
 //  limitations under the License.
 ////////////////////////////////////////////////////////////////////////////////
 
+#include <unistd.h>
+
 #include "ldlidar_component.hpp"
 #include "ldlidar_tools.hpp"
 #include "rcl_interfaces/msg/parameter_descriptor.hpp"
@@ -214,10 +216,16 @@ nav2_util::CallbackReturn LdLidarComponent::on_configure(const lc::State & prev_
   // <---- Initialize publisher
 
   // ----> Connect to Lidar
+  // Not fatal when the device is missing: the lidar thread keeps trying
+  // to open the port once a second, so a lidar plugged in after bringup
+  // (or unplugged and plugged back) comes up on its own.
   if (!initLidar()) {
-    return nav2_util::CallbackReturn::ERROR;  // Transition to Finalized state
-    // Note: we could use FAILURE instead of ERROR to remain in unconfigured
-    // state and try again to connect
+    RCLCPP_WARN(
+      get_logger(), "LDLidar not available on '%s' - will open it when it appears",
+      _serialPort.c_str());
+    _connected = false;
+  } else {
+    _connected = true;
   }
   // <---- Connect to Lidar
 
@@ -510,6 +518,22 @@ void LdLidarComponent::lidarThreadFunc()
     }
     // <---- Interruption check
 
+    // ----> Device lost / not there yet: wait for the path, reopen, go on
+    if (!_connected) {
+      _publishing = false;
+      rclcpp::sleep_for(std::chrono::seconds(1));
+      if (access(_serialPort.c_str(), F_OK) != 0) {
+        continue;                         // cable still out
+      }
+      if (_lidar && initLidarComm()) {
+        _connected = true;
+        _timeoutSince = 0.0;
+        RCLCPP_INFO(get_logger(), "LDLidar is back on '%s'", _serialPort.c_str());
+      }
+      continue;
+    }
+    // <---- Device lost / not there yet
+
     int nSub = count_subscribers(_scanTopic);
     if (nSub > 0) {
       _publishing = true;
@@ -517,11 +541,29 @@ void LdLidarComponent::lidarThreadFunc()
         case ldlidar::LidarStatus::NORMAL:
           _lidar->GetLidarScanFreq(lidar_scan_freq);
           publishLaserScan(laser_scan_points, lidar_scan_freq);
+          _timeoutSince = 0.0;
           break;
-        case ldlidar::LidarStatus::DATA_TIME_OUT:
-          RCLCPP_ERROR(
-            get_logger(), "get ldlidar data is time out, please check your lidar device.");
+        case ldlidar::LidarStatus::DATA_TIME_OUT: {
+          // A few seconds of timeouts is a device that is gone (the file
+          // descriptor stays valid after an unplug; only the data stops).
+          // Close it and wait for the path to come back rather than log
+          // this ten times a second forever.
+          const double now_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+          if (_timeoutSince == 0.0) {
+            _timeoutSince = now_s;
+            RCLCPP_ERROR(
+              get_logger(), "get ldlidar data is time out, please check your lidar device.");
+          } else if (now_s - _timeoutSince > _lostAfter_sec) {
+            RCLCPP_WARN(
+              get_logger(), "LDLidar lost (no data for %.0f s): closing '%s' and waiting for it",
+              _lostAfter_sec, _serialPort.c_str());
+            _lidar->Stop();
+            _connected = false;
+            _timeoutSince = 0.0;
+          }
           break;
+        }
         case ldlidar::LidarStatus::DATA_WAIT:
           break;
         default:
@@ -547,6 +589,12 @@ void LdLidarComponent::callback_updateDiagnostic(diagnostic_updater::DiagnosticS
 {
   rclcpp_lifecycle::State state = get_current_state();
 
+  if (state.id() == 3 && !_connected) {  // ACTIVE but no device
+    stat.summary(
+      diagnostic_msgs::msg::DiagnosticStatus::ERROR,
+      std::string("Lidar not connected on ") + _serialPort);
+    return;
+  }
   if (state.id() == 3) {  // ACTIVE
     stat.summary(
       diagnostic_msgs::msg::DiagnosticStatus::OK, std::string(
